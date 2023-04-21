@@ -184,10 +184,39 @@ class ResponseMatcher:
                 return body
 
 
+class RallyTCPConnector(aiohttp.TCPConnector):
+    def __init__(self, *args, **kwargs):
+        self.client_id = kwargs.pop("client_id", None)
+        self.logger = logging.getLogger(__name__)
+        super().__init__(*args, **kwargs)
+
+    def _select_host(self, hosts):
+        """
+        Selects a host from a list of hosts based on the client id assigned by the factory
+        """
+        host = hosts[self.client_id % len(hosts)]
+        self.logger.debug("client id [%s] selected host [{%s}]", self.client_id, host)
+        return host
+
+    async def _resolve_host(self, *args, **kwargs):
+        hosts = await super()._resolve_host(*args, **kwargs)
+        # super()._resolve_host() does actually return all the IPs a given name resolves to, but the underlying
+        # super()._create_direct_connection() logic only ever selects the first succesful host from this list from which
+        # to establish a connection
+        #
+        # self._select_host() uses the factory assigned client_id to deterministically return a IP from this list, which
+        # we then insert at the beginning of the list to evenly distributes connections across _all_ clients
+        # see https://github.com/elastic/rally/issues/1598
+        self.logger.debug("client id [%s] resolved hosts [{%s}]", self.client_id, hosts)
+        hosts[0] = self._select_host(hosts)
+        return hosts
+
+
 class RallyAiohttpHttpNode(AiohttpHttpNode):
     def __init__(self, config):
         super().__init__(config)
         self._loop = None
+        self.client_id = None
         self.trace_configs = None
         self.enable_cleanup_closed = None
         self._static_responses = None
@@ -217,11 +246,12 @@ class RallyAiohttpHttpNode(AiohttpHttpNode):
         if self._static_responses:
             connector = StaticConnector(limit_per_host=self._connections_per_node, enable_cleanup_closed=self.enable_cleanup_closed)
         else:
-            connector = aiohttp.TCPConnector(
+            connector = RallyTCPConnector(
                 limit_per_host=self._connections_per_node,
                 use_dns_cache=True,
                 ssl=self._ssl_context,
                 enable_cleanup_closed=self.enable_cleanup_closed,
+                client_id=self.client_id,
             )
 
         self.session = aiohttp.ClientSession(
