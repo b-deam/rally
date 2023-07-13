@@ -23,9 +23,10 @@ from functools import partial
 
 import tabulate
 
-from esrally import exceptions, metrics
+from esrally import exceptions, metrics, time
 from esrally.utils import console, convert
 from esrally.utils import io as rio
+from esrally.utils import usl
 
 FINAL_SCORE = r"""
 ------------------------------------------------------
@@ -1036,3 +1037,54 @@ class ComparisonReporter:
             return color_smaller(formatted)
         else:
             return color_neutral(formatted)
+
+
+def calculate_usl(cfg):
+    race_store = metrics.race_store(cfg)
+
+    # num shards/nodes/unit of concurrency
+    x = []
+
+    # throughput
+    y = []
+
+    races = race_store.list()
+    details = []
+    for r in races:
+        race = race_store.find_by_race_id(r.race_id)
+
+        n = race.track_params.get("number_of_shards")
+        if not n:
+            continue
+
+        stats = metrics.GlobalStats(race.results)
+        try:
+            tput = stats.metrics("bulk-index")["throughput"]["median"]
+        except TypeError:
+            continue
+
+        if n and tput:
+            x.append(n)
+            y.append(tput)
+
+        details.append(
+            [
+                race.race_id,
+                time.to_iso8601(race.race_timestamp),
+                race.track,
+                race.challenge_name,
+                race.distribution_version,
+                race.revision,
+                n,
+                tput,
+            ]
+        )
+
+    console.println(
+        tabulate.tabulate(
+            details,
+            headers=["Race ID", "Race Timestamp", "Track", "Challenge", "ES Version", "Revision", "Concurrency", "Throughput"],
+        )
+    )
+
+    usl.fit(x, y)

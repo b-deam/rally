@@ -286,6 +286,41 @@ def create_arg_parser():
         default=True,
     )
 
+    usl_parser = subparsers.add_parser("usl", help="Apply the USL to the specified race")
+    usl_parser.add_argument(
+        "--task-name",
+        required=False,
+        help="Name of the task for which to return the throughput.",
+    )
+    usl_parser.add_argument(
+        "--limit",
+        help="Limit the number of search results for recent races (default: 200).",
+        default=200,
+    )
+    usl_parser.add_argument(
+        "--track",
+        help="Show only records from this track",
+        default=None,
+    )
+    usl_parser.add_argument(
+        "--benchmark-name",
+        help="Show only records from with corresponding 'name' or 'benchmark-name' user tag",
+        default=None,
+    )
+    usl_parser.add_argument(
+        "--from-date",
+        help="Show only records on or after this date (format: yyyyMMdd)",
+        type=valid_date,
+        default=None,
+    )
+    usl_parser.add_argument(
+        "--to-date",
+        help="Show only records before or on this date (format: yyyyMMdd)",
+        type=valid_date,
+        default=None,
+    )
+    add_track_source(usl_parser)
+
     build_parser = subparsers.add_parser("build", help="Builds an artifact")
     build_parser.add_argument(
         "--revision",
@@ -809,6 +844,7 @@ def create_arg_parser():
         add_parser,
         race_parser,
         compare_parser,
+        usl_parser,
         build_parser,
         download_parser,
         install_parser,
@@ -1074,6 +1110,13 @@ def dispatch_sub_command(arg_parser, args, cfg):
         if sub_command == "compare":
             configure_reporting_params(args, cfg)
             reporter.compare(cfg, args.baseline, args.contender)
+        elif sub_command == "usl":
+            cfg.add(config.Scope.applicationOverride, "system", "list.max_results", args.limit)
+            cfg.add(config.Scope.applicationOverride, "system", "admin.track", args.track)
+            cfg.add(config.Scope.applicationOverride, "system", "list.races.benchmark_name", args.benchmark_name)
+            cfg.add(config.Scope.applicationOverride, "system", "list.from_date", args.from_date)
+            cfg.add(config.Scope.applicationOverride, "system", "list.to_date", args.to_date)
+            reporter.calculate_usl(cfg)
         elif sub_command == "list":
             cfg.add(config.Scope.applicationOverride, "system", "list.config.option", args.configuration)
             cfg.add(config.Scope.applicationOverride, "system", "list.max_results", args.limit)

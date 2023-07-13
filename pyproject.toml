@@ -77,6 +77,12 @@ dependencies = [
     "google-resumable-media[requests]==1.1.0",
     # License: Apache 2.0
     "google-auth==1.22.1",
+    # License: BSD
+    "numpy==1.24.3",
+    # License: Python Software Foundation License (PSF)
+    "matplotlib==3.7.2",
+    # License: BSD
+    "scipy==1.10.1",
 ]
 
 [project.optional-dependencies]
