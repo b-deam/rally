@@ -16,6 +16,7 @@
 # under the License.
 
 import asyncio
+import uvloop
 import collections
 import concurrent.futures
 import datetime
@@ -1721,7 +1722,7 @@ class AsyncIoAdapter:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            loop = asyncio.new_event_loop()
+            loop = uvloop.new_event_loop()
             loop.set_debug(self.debug_event_loop)
             loop.set_exception_handler(self._logging_exception_handler)
             asyncio.set_event_loop(loop)
