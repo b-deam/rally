@@ -23,6 +23,7 @@ import logging
 import math
 import numbers
 import operator
+import os
 import random
 import time
 from abc import ABC
@@ -32,6 +33,21 @@ from typing import Callable, Deque
 from esrally import exceptions
 from esrally.track import track
 from esrally.utils import io
+
+# Prototype: optional native (Rust) bulk read + assembly for the constant
+# action-metadata mmap fast path. Enabled only when the extension is importable
+# and RALLY_NATIVE_READER is truthy, so default behaviour is unchanged.
+try:
+    import rally_parse as _rally_parse
+except ImportError:
+    _rally_parse = None
+
+_NATIVE_READER_ENABLED = (
+    _rally_parse is not None
+    and hasattr(_rally_parse, "assemble_bulk")
+    and hasattr(_rally_parse, "assemble_bulk_regular")
+    and os.environ.get("RALLY_NATIVE_READER", "").lower() in ("1", "true", "yes", "on")
+)
 
 __PARAM_SOURCES_BY_OP: dict[track.OperationType, ParamSource] = {}
 __PARAM_SOURCES_BY_NAME: dict[str, ParamSource] = {}
@@ -1393,9 +1409,15 @@ class MetadataIndexDataReader(IndexDataReader):
         """
         Special-case implementation for bulk data files where the action and meta-data line is always identical.
         """
-        current_bulk = []
         # hoist
         action_metadata_line = self.action_metadata_line.encode("utf-8")
+
+        if _NATIVE_READER_ENABLED:
+            native = self._read_bulk_fast_native(action_metadata_line)
+            if native is not None:
+                return native
+
+        current_bulk = []
         docs = next(self.file_source)
 
         for doc in docs:
@@ -1403,11 +1425,41 @@ class MetadataIndexDataReader(IndexDataReader):
             current_bulk.append(doc)
         return len(docs), current_bulk
 
+    def _read_bulk_fast_native(self, action_metadata_line):
+        """
+        Native fast path: when reading from a memory-mapped source, assemble the
+        whole bulk body (metadata + doc per line) in Rust and return it as a
+        single joined bytes object, avoiding per-line Python bytes creation.
+
+        Returns ``(doc_count, [body])`` or ``None`` if the source is not a
+        memory-mapped slice (in which case the caller uses the Python path).
+        Raises ``StopIteration`` when the slice is exhausted, mirroring
+        ``Slice.__next__``.
+        """
+        source = getattr(self.file_source, "source", None)
+        mm = getattr(source, "mm", None) if source is not None else None
+        if mm is None:
+            return None
+        to_read = min(self.file_source.bulk_size, self.file_source.number_of_lines - self.file_source.current_line)
+        if to_read <= 0:
+            raise StopIteration()
+        count, new_offset, body = _rally_parse.assemble_bulk(mm, mm.tell(), to_read, action_metadata_line)
+        if count == 0:
+            raise StopIteration()
+        mm.seek(new_offset)
+        self.file_source.current_line += count
+        return count, [body]
+
     def _read_bulk_regular(self):
         """
         General case implementation for bulk files. This implementation can cover all cases but is slower when the
         action and meta-data line is always identical.
         """
+        if _NATIVE_READER_ENABLED:
+            native = self._read_bulk_regular_native()
+            if native is not None:
+                return native
+
         current_bulk = []
         docs = next(self.file_source)
         for doc in docs:
@@ -1424,6 +1476,54 @@ class MetadataIndexDataReader(IndexDataReader):
             else:
                 current_bulk.append(doc)
         return len(docs), current_bulk
+
+    def _read_bulk_regular_native(self):
+        """
+        Native general path: assemble a bulk body (per-doc metadata + doc, with the
+        ``update`` action wrapping the doc in ``{"doc": ...}``) directly from a
+        memory-mapped source, avoiding one Python bytes object per line.
+
+        Action metadata generation stays in Python (it owns the id/conflict RNG);
+        because the metadata does not depend on document content it can be produced
+        up front and handed to native code purely for byte assembly. Returns
+        ``(doc_count, [body])`` or ``None`` when the source is not memory-mapped (so
+        the caller falls back to the Python path). Raises ``StopIteration`` when the
+        slice or the action-metadata iterator is exhausted, mirroring
+        ``_read_bulk_regular`` + ``Slice.__next__``.
+        """
+        fs = self.file_source
+        source = getattr(fs, "source", None)
+        mm = getattr(source, "mm", None) if source is not None else None
+        if mm is None:
+            return None
+        to_read = min(fs.bulk_size, fs.number_of_lines - fs.current_line)
+        if to_read <= 0:
+            raise StopIteration()
+        # Generate metadata for the whole bulk up front. A short read means the
+        # action-metadata iterator is exhausted mid-bulk; the Python path discards
+        # such a partial bulk (StopIteration propagates out of _read_bulk_regular),
+        # so we replicate that by discarding it here too.
+        action_metadata = self.action_metadata
+        metadata = []
+        exhausted = False
+        try:
+            for _ in range(to_read):
+                item = next(action_metadata)
+                if item:
+                    action_type, action_metadata_line = item
+                    metadata.append((action_type == "update", action_metadata_line.encode("utf-8")))
+                else:
+                    metadata.append(None)
+        except StopIteration:
+            exhausted = True
+        if exhausted:
+            raise StopIteration()
+        count, new_offset, body = _rally_parse.assemble_bulk_regular(mm, mm.tell(), metadata)
+        if count == 0:
+            raise StopIteration()
+        mm.seek(new_offset)
+        fs.current_line += count
+        return count, [body]
 
 
 class SourceOnlyIndexDataReader(IndexDataReader):

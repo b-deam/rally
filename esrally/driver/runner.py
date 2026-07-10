@@ -19,6 +19,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import os
 import random
 import re
 import sys
@@ -30,7 +31,7 @@ from enum import Enum
 from functools import total_ordering
 from io import BytesIO
 from os.path import commonprefix
-from types import FunctionType
+from types import FunctionType, SimpleNamespace
 from typing import Optional
 
 import ijson
@@ -38,6 +39,33 @@ import ijson
 from esrally import exceptions, track, types
 from esrally.utils import convert
 from esrally.utils.versions import Version
+
+# Prototype: optional native (Rust/PyO3) implementation of the hot `parse` path.
+# Enabled only when the `rally_parse` extension is importable *and* the
+# RALLY_NATIVE_PARSE env var is truthy, so default behaviour is unchanged.
+try:
+    import rally_parse as _rally_parse
+except ImportError:
+    _rally_parse = None
+
+_NATIVE_PARSE_ENABLED = _rally_parse is not None and os.environ.get("RALLY_NATIVE_PARSE", "").lower() in ("1", "true", "yes", "on")
+
+# Prototype: optional native implementation of BulkIndex.detailed_stats (the
+# hotspot identified by driver profiling with detailed-results enabled).
+_NATIVE_BULK_ENABLED = (
+    _rally_parse is not None
+    and hasattr(_rally_parse, "bulk_detailed_stats")
+    and os.environ.get("RALLY_NATIVE_BULK", "").lower() in ("1", "true", "yes", "on")
+)
+
+# Prototype: optional "fast bulk" send path. Once the corpus read, bulk assembly and
+# detailed_stats are native, the driver's remaining per-bulk cost is dominated by the
+# elasticsearch-py / elastic_transport machinery (parameter rewriting, multi-layer
+# HTTP header construction/normalization, body re-serialization). When enabled, the
+# bulk runner bypasses the high-level client and calls the selected transport node
+# directly with pre-built (cached) compatibility headers and the already-assembled
+# raw ndjson body. Off by default so behaviour is unchanged.
+_FAST_BULK_ENABLED = os.environ.get("RALLY_FAST_BULK", "").lower() in ("1", "true", "yes", "on")
 
 # Mapping from operation type to specific runner
 
@@ -534,6 +562,42 @@ class BulkStats:
         return d
 
 
+class _ParsedResponse(dict):
+    """
+    Minimal stand-in used only for the native detailed_stats fallback path: wraps a
+    parsed response dict and exposes ``.meta.status`` so the pure-Python
+    ``detailed_stats`` can consume it unchanged.
+    """
+
+    def __init__(self, data, status):
+        super().__init__(data)
+        self.meta = SimpleNamespace(status=status)
+
+
+class _RawBulkResponse:
+    """
+    Response returned by the fast-bulk path. Mirrors the raw ``BytesIO`` body the
+    regular client path produces when ``return_raw_response`` is set (``getvalue()``,
+    ``read()``, ``seek()``) and additionally exposes ``meta.status`` from the transport
+    node's response meta, so every bulk stats path (native, detailed, simple) works.
+    """
+
+    __slots__ = ("meta", "_buf")
+
+    def __init__(self, meta, data):
+        self.meta = meta
+        self._buf = BytesIO(data)
+
+    def getvalue(self):
+        return self._buf.getvalue()
+
+    def read(self, *args):
+        return self._buf.read(*args)
+
+    def seek(self, *args):
+        return self._buf.seek(*args)
+
+
 class BulkIndex(Runner):
     """
     Bulk indexes the given documents.
@@ -593,12 +657,23 @@ class BulkIndex(Runner):
         unit = mandatory(params, "unit", self)
         retries_on_429 = params.get("retries_on_429", 0)
 
-        if not detailed_results:
+        # The fast-bulk path handles the raw response itself (it never goes through the
+        # client's lazy JSON serializer), so the raw_response flag only matters for the
+        # regular client path below.
+        use_fast_bulk = _FAST_BULK_ENABLED and with_action_metadata and isinstance(params.get("body"), (bytes, str))
+
+        # The native detailed_stats path works directly off the raw response bytes,
+        # so we must also request the raw response when it is active.
+        native_detailed = detailed_results and _NATIVE_BULK_ENABLED and isinstance(params.get("body"), (bytes, str))
+        if not use_fast_bulk and (not detailed_results or native_detailed):
             es.return_raw_response()
 
-        if with_action_metadata:
-            api_kwargs.pop("index", None)
-        response = await es.bulk(params=bulk_params, **api_kwargs)
+        if use_fast_bulk:
+            response = await self._fast_bulk(es, api_kwargs["body"], bulk_params)
+        else:
+            if with_action_metadata:
+                api_kwargs.pop("index", None)
+            response = await es.bulk(params=bulk_params, **api_kwargs)
 
         stats = self._parse_stats(params, bulk_size, unit, response, api_kwargs, detailed_results)
 
@@ -627,8 +702,90 @@ class BulkIndex(Runner):
 
     def _parse_stats(self, params, bulk_size, unit, response, api_kwargs, detailed_results):
         if detailed_results:
+            if _NATIVE_BULK_ENABLED and isinstance(params.get("body"), (bytes, str)) and hasattr(response, "getvalue"):
+                return self._detailed_stats_native(params, response)
+            # The pure-Python detailed_stats needs a dict-like response; the fast-bulk
+            # path returns raw bytes, so parse them into the expected shape.
+            if isinstance(response, _RawBulkResponse):
+                response = _ParsedResponse(json.loads(response.getvalue()), response.meta.status)
             return self.detailed_stats(params, response)
         return self.simple_stats(bulk_size, unit, response, api_kwargs)
+
+    def _fast_bulk(self, es, body, bulk_params):
+        """
+        Send a bulk request while bypassing the elasticsearch-py high-level ``bulk()``
+        wrapper and the transport's per-request machinery.
+
+        The preferred path calls the node's aiohttp session directly: the session is
+        created with the node's default headers (including auth), so we only add the
+        cached compatibility Accept/Content-Type headers and hand it the already-assembled
+        raw ndjson body. This skips the elastic_transport node wrapper's per-request work
+        (default-header copy, ``ApiResponseMeta``/``HttpHeaders`` construction from the
+        response, and ``_log_request`` -- which eagerly decodes the whole body even when
+        DEBUG logging is off). Service-time timing is unaffected because it is driven by
+        the aiohttp trace-config callbacks registered on the session.
+
+        Falls back to the node's ``perform_request`` when the session is not yet created
+        or request body compression is enabled (which the node handles). Returns a
+        ``_RawBulkResponse`` exposing ``meta`` and ``getvalue()`` so the existing stats
+        paths work unchanged. Returns a coroutine.
+        """
+        node = es.transport.node_pool.get()
+        fb = getattr(es, "_rally_fast_bulk", None)
+        if fb is None:
+            import aiohttp
+
+            from esrally.client import common
+
+            fb = {
+                "aiohttp": aiohttp,
+                "headers": common.ensure_mimetype_headers(
+                    headers=None, path="/_bulk", body=b"x", version=getattr(es, "distribution_version", None)
+                ),
+                "timeout": None,
+            }
+            es._rally_fast_bulk = fb
+
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        target = "/_bulk"
+        if bulk_params:
+            from esrally.client import common
+
+            target = "/_bulk?" + common._quote_query(bulk_params)
+
+        headers = fb["headers"]
+        session = getattr(node, "session", None)
+        if session is not None and not getattr(node, "_http_compress", False):
+            timeout = fb["timeout"]
+            if timeout is None:
+                rt = getattr(node.config, "request_timeout", None)
+                timeout = fb["aiohttp"].ClientTimeout(total=rt if rt is not None else 0)
+                fb["timeout"] = timeout
+            return self._fast_bulk_send_direct(session, node.base_url + target, body, headers, timeout)
+        return self._fast_bulk_send_node(node, target, body, headers)
+
+    async def _fast_bulk_send_direct(self, session, url, body, headers, timeout):
+        async with session.request("PUT", url, data=body, headers=headers, timeout=timeout) as resp:
+            raw = await resp.read()
+            return _RawBulkResponse(SimpleNamespace(status=resp.status), raw)
+
+    async def _fast_bulk_send_node(self, node, target, body, headers):
+        meta, raw = await node.perform_request("PUT", target, body=body, headers=headers)
+        return _RawBulkResponse(meta, raw)
+
+    def _detailed_stats_native(self, params, response):
+        body = params["body"]
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        with_action_metadata = mandatory(params, "action-metadata-present", self)
+        try:
+            result = _rally_parse.bulk_detailed_stats(response.getvalue(), body, with_action_metadata)
+            return BulkStats(request_status=response.meta.status, **result)
+        except Exception:
+            self.logger.warning("Native detailed_stats failed; falling back to Python implementation.", exc_info=True)
+            parsed = _ParsedResponse(json.loads(response.getvalue()), response.meta.status)
+            return self.detailed_stats(params, parsed)
 
     def _build_retry_body(self, api_kwargs, error_429_indices):
         bulk_lines = self.get_bulk_lines(api_kwargs)
@@ -912,6 +1069,25 @@ class NodeStats(Runner):
 
 
 def parse(
+    text: BytesIO,
+    props: list[str],
+    lists: list[str] = None,
+    objects: list[str] = None,
+    stop_after: str = None,
+    with_cluster_details: bool = False,
+) -> dict:
+    """
+    Dispatches to the native (Rust) parser when it is enabled and the requested
+    features fall within its supported subset (scalar ``props`` and ``lists``
+    emptiness only). Otherwise falls back to the pure-Python ijson implementation.
+    """
+    if _NATIVE_PARSE_ENABLED and objects is None and stop_after is None and not with_cluster_details:
+        data = text.getvalue() if hasattr(text, "getvalue") else text
+        return _rally_parse.parse(data, props, lists)
+    return _parse_ijson(text, props, lists, objects, stop_after, with_cluster_details)
+
+
+def _parse_ijson(
     text: BytesIO,
     props: list[str],
     lists: list[str] = None,

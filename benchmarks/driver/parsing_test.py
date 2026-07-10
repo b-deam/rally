@@ -24,6 +24,13 @@ import ujson
 
 from esrally.driver import runner
 
+try:
+    import rally_parse
+except ImportError:
+    rally_parse = None
+
+requires_native = pytest.mark.skipif(rally_parse is None, reason="rally_parse native extension not built (see native/rally_parse)")
+
 
 @pytest.mark.benchmark(
     group="parse",
@@ -326,3 +333,95 @@ class TestParsingBenchmarks:
         .replace("\n", "")
         .replace(" ", "")
     )
+
+    # A response with a realistically large hits array (~10k hits). This is where
+    # the pure-Python ijson event loop hurts the most on a busy load driver.
+    huge_page = json.dumps(
+        {
+            "pit_id": "fedcba9876543210",
+            "took": 10,
+            "timed_out": False,
+            "hits": {
+                "total": {"value": 10000, "relation": "eq"},
+                "hits": [
+                    {"_id": str(i), "timestamp": 1609780186, "sort": [1609780186, str(i)]} for i in range(10000)
+                ],
+            },
+        },
+        separators=(",", ":"),
+    )
+
+
+# --- Head-to-head: ijson (current) vs native Rust parse for the hot signatures ---
+#
+# The default (non-detailed) Query path calls: parse(r, ["timed_out", "took"], ["hits.hits"]).
+# The default BulkIndex path calls: parse(response, ["errors", "took"]).
+# These are the two most frequently executed parse() invocations on a load driver.
+
+QUERY_PROPS = ["timed_out", "took"]
+QUERY_LISTS = ["hits.hits"]
+
+
+def query_parse_ijson(response_bytes):
+    return runner._parse_ijson(io.BytesIO(response_bytes), QUERY_PROPS, QUERY_LISTS)
+
+
+def query_parse_native(response_bytes):
+    return rally_parse.parse(response_bytes, QUERY_PROPS, QUERY_LISTS)
+
+
+def pit_id_native(response_bytes):
+    return rally_parse.parse(response_bytes, ["pit_id"])["pit_id"]
+
+
+@pytest.mark.benchmark(group="parse_query_small", warmup="on", warmup_iterations=10000, disable_gc=True)
+def test_query_parse_ijson_small(benchmark):
+    page = TestParsingBenchmarks.small_page.encode()
+    benchmark(query_parse_ijson, page)
+
+
+@requires_native
+@pytest.mark.benchmark(group="parse_query_small", warmup="on", warmup_iterations=10000, disable_gc=True)
+def test_query_parse_native_small(benchmark):
+    page = TestParsingBenchmarks.small_page.encode()
+    benchmark(query_parse_native, page)
+
+
+@pytest.mark.benchmark(group="parse_query_large", warmup="on", warmup_iterations=10000, disable_gc=True)
+def test_query_parse_ijson_large(benchmark):
+    page = TestParsingBenchmarks.large_page.encode()
+    benchmark(query_parse_ijson, page)
+
+
+@requires_native
+@pytest.mark.benchmark(group="parse_query_large", warmup="on", warmup_iterations=10000, disable_gc=True)
+def test_query_parse_native_large(benchmark):
+    page = TestParsingBenchmarks.large_page.encode()
+    benchmark(query_parse_native, page)
+
+
+@pytest.mark.benchmark(group="parse_query_huge", warmup="on", warmup_iterations=1000, disable_gc=True)
+def test_query_parse_ijson_huge(benchmark):
+    page = TestParsingBenchmarks.huge_page.encode()
+    benchmark(query_parse_ijson, page)
+
+
+@requires_native
+@pytest.mark.benchmark(group="parse_query_huge", warmup="on", warmup_iterations=1000, disable_gc=True)
+def test_query_parse_native_huge(benchmark):
+    page = TestParsingBenchmarks.huge_page.encode()
+    benchmark(query_parse_native, page)
+
+
+@requires_native
+@pytest.mark.benchmark(group="parse", warmup="on", warmup_iterations=10000, disable_gc=True)
+def test_pit_id_parse_native_small(benchmark):
+    page = TestParsingBenchmarks.small_page.encode()
+    benchmark(pit_id_native, page)
+
+
+@requires_native
+@pytest.mark.benchmark(group="parse_large", warmup="on", warmup_iterations=10000, disable_gc=True)
+def test_pit_id_parse_native_large(benchmark):
+    page = TestParsingBenchmarks.large_page.encode()
+    benchmark(pit_id_native, page)
